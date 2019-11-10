@@ -9,6 +9,7 @@ package udp
 import (
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,7 +25,7 @@ import (
 	"github.com/yyyar/gobetween/server/udp/session"
 	"github.com/yyyar/gobetween/stats"
 	"github.com/yyyar/gobetween/utils"
-	"github.com/eric-lindau/udpfacade"
+	"github.com/panjf2000/gnet"
 )
 
 const UDP_PACKET_SIZE = 65507
@@ -36,6 +37,9 @@ var log = logging.For("udp/server")
  * UDP server implementation
  */
 type Server struct {
+	/* gnet */
+	*gnet.EventServer
+
 	/* Server name */
 	name string
 
@@ -44,9 +48,6 @@ type Server struct {
 
 	/* Scheduler */
 	scheduler *scheduler.Scheduler
-
-	/* Server connection */
-	serverConn *net.UDPConn
 
 	/* Flag indicating that server is stopped */
 	stopped uint32
@@ -117,7 +118,6 @@ func (this *Server) Start() error {
 
 	this.scheduler.StatsHandler.Start()
 	this.scheduler.Start()
-	this.serve()
 
 	go func() {
 
@@ -133,8 +133,6 @@ func (this *Server) Start() error {
 				atomic.StoreUint32(&this.stopped, 1)
 
 				ticker.Stop()
-
-				this.serverConn.Close()
 
 				this.scheduler.StatsHandler.Stop()
 				this.scheduler.Stop()
@@ -158,72 +156,17 @@ func (this *Server) Start() error {
  * Start accepting connections
  */
 func (this *Server) listen() error {
-	listenAddr, err := net.ResolveUDPAddr("udp", this.cfg.Bind)
-	if err != nil {
-		return fmt.Errorf("Failed to resolve udp address %v : %v", this.cfg.Bind, err)
-	}
 
-	this.serverConn, err = net.ListenUDP("udp", listenAddr)
-
-	if err != nil {
-		return fmt.Errorf("Failed to create listening udp socket: %v", err)
+	for i := 0;  i <= runtime.NumCPU(); i++ {
+		go func() {
+			listenAddr := fmt.Sprintf("udp://%s", this.cfg.Bind)
+			err := gnet.Serve(this, listenAddr, gnet.WithMulticore(false), gnet.WithReusePort(true))
+			log.Errorf("Failed to create listening udp socket: %v", err)
+			return
+		}()
 	}
 
 	return nil
-}
-
-/**
- * Start serving
- */
-func (this *Server) serve() {
-
-	cfg := session.Config{
-		MaxRequests:        this.cfg.Udp.MaxRequests,
-		MaxResponses:       this.cfg.Udp.MaxResponses,
-		ClientIdleTimeout:  utils.ParseDurationOrDefault(*this.cfg.ClientIdleTimeout, 0),
-		BackendIdleTimeout: utils.ParseDurationOrDefault(*this.cfg.BackendIdleTimeout, 0),
-		Transparent:        this.cfg.Udp.Transparent,
-	}
-
-	// Main loop goroutine - reads incoming data and decides what to do
-	go func() {
-
-		buf := make([]byte, UDP_PACKET_SIZE)
-		for {
-			n, clientAddr, err := this.serverConn.ReadFromUDP(buf)
-
-			if err != nil {
-				if atomic.LoadUint32(&this.stopped) == 1 {
-					return
-				}
-
-				log.Error("Failed to read from UDP: ", err)
-
-				continue
-			}
-
-			if this.access != nil {
-				if !this.access.Allows(&clientAddr.IP) {
-					log.Debug("Client disallowed to connect: ", clientAddr.IP)
-					continue
-				}
-			}
-
-			//special case for single request mode
-			if cfg.MaxRequests == 1 {
-				err := this.fireAndForget(clientAddr, buf[:n])
-
-				if err != nil {
-					log.Errorf("Error sending data to backend: %v ", err)
-				}
-
-				continue
-			}
-
-			this.proxy(cfg, clientAddr, buf[:n])
-
-		}
-	}()
 }
 
 /**
@@ -243,48 +186,38 @@ func (this *Server) cleanup() {
 	this.scheduler.StatsHandler.Connections <- uint(len(this.sessions))
 }
 
+func (this *Server) OnInitComplete(srv gnet.Server) (action gnet.Action) {
+	log.Debugf("Server is listening on %s (multi-cores: %t, loops: %d)", srv.Addr.String(), srv.Multicore, srv.NumLoops)
+	return
+}
+
+func (this *Server) React(c gnet.Conn) (out []byte, action gnet.Action) {
+	data := append([]byte{}, c.Read()...)
+	c.ResetBuffer()
+
+	this.proxy(c, data)
+	return
+}
+
 /**
  * Elect and connect to backend
  */
-func (this *Server) electAndConnect(clientAddr *net.UDPAddr) (net.Conn, *core.Backend, error) {
+func (this *Server) elect(clientAddr *net.UDPAddr) (*core.Backend, error) {
 	backend, err := this.scheduler.TakeBackend(core.UdpContext{
 		ClientAddr: *clientAddr,
 	})
 
 	if err != nil {
-		return nil, nil, fmt.Errorf("Could not elect backend for clientAddr %v: %v", clientAddr, err)
+		return nil, fmt.Errorf("Could not elect backend for clientAddr %v: %v", clientAddr, err)
 	}
 
-	host := backend.Host
-	port := backend.Port
-
-	addrStr := host + ":" + port
-
-	addr, err := net.ResolveUDPAddr("udp", addrStr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Could not resolve udp address %s: %v", addrStr, err)
-	}
-
-	var conn net.Conn
-	if this.cfg.Udp.Transparent {
-		conn, err = udpfacade.DialUDPFrom(clientAddr, addr)
-		if err != nil {
-			return nil, nil, fmt.Errorf("Could not dial UDP addr %v from %v: %v", addr, clientAddr, err)
-		}
-	} else {
-		conn, err = net.DialUDP("udp", nil, addr)
-		if err != nil {
-			return nil, nil, fmt.Errorf("Could not dial UDP addr %v: %v", addr, err)
-		}
-	}
-
-	return conn, backend, nil
+	return backend, nil
 }
 
 /**
  * Get or create session
  */
-func (this *Server) getOrCreateSession(cfg session.Config, clientAddr *net.UDPAddr) (*session.Session, error) {
+func (this *Server) getOrCreateSession(clientAddr *net.UDPAddr, serverConn gnet.Conn) (*session.Session, error) {
 	key := clientAddr.String()
 
 	this.mu.Lock()
@@ -302,15 +235,22 @@ func (this *Server) getOrCreateSession(cfg session.Config, clientAddr *net.UDPAd
 		go func() { s.Close() }()
 	}
 
-	conn, backend, err := this.electAndConnect(clientAddr)
+	backend, err := this.elect(clientAddr)
 	if err != nil {
-		return nil, fmt.Errorf("Could not elect/connect to backend: %v", err)
+		return nil, fmt.Errorf("Could not elect to backend: %v", err)
 	}
 
-	s = session.NewSession(clientAddr, conn, *backend, this.scheduler, cfg)
-	if !cfg.Transparent {
-		s.ListenResponses(this.serverConn)
+	cfg := session.Config{
+		MaxRequests:        this.cfg.Udp.MaxRequests,
+		MaxResponses:       this.cfg.Udp.MaxResponses,
+		ClientIdleTimeout:  utils.ParseDurationOrDefault(*this.cfg.ClientIdleTimeout, 0),
+		BackendIdleTimeout: utils.ParseDurationOrDefault(*this.cfg.BackendIdleTimeout, 0),
+		Transparent:        this.cfg.Udp.Transparent,
 	}
+
+	s = session.NewSession(clientAddr, *backend, this.scheduler, cfg, serverConn)
+
+	log.Debugf("%s -> %s -> %s:%s", serverConn.RemoteAddr(), serverConn.LocalAddr(), backend.Host, backend.Port)
 
 	this.sessions[key] = s
 
@@ -322,9 +262,15 @@ func (this *Server) getOrCreateSession(cfg session.Config, clientAddr *net.UDPAd
 /**
  * Get the session and send data via chosen session
  */
-func (this *Server) proxy(cfg session.Config, clientAddr *net.UDPAddr, buf []byte) {
+func (this *Server) proxy(serverConn gnet.Conn, buf []byte) {
 
-	s, err := this.getOrCreateSession(cfg, clientAddr)
+	clientAddr, ok := serverConn.RemoteAddr().(*net.UDPAddr)
+	if !ok {
+		log.Errorf("Not an UDP Addr")
+		return
+	}
+
+	s, err := this.getOrCreateSession(clientAddr, serverConn)
 	if err != nil {
 		log.Error(err)
 		return
@@ -335,31 +281,6 @@ func (this *Server) proxy(cfg session.Config, clientAddr *net.UDPAddr, buf []byt
 		log.Errorf("Could not write data to UDP 'session' %v: %v", s, err)
 		return
 	}
-
-}
-
-/**
- * Omit creating session, just send one packet of data
- */
-func (this *Server) fireAndForget(clientAddr *net.UDPAddr, buf []byte) error {
-
-	conn, backend, err := this.electAndConnect(clientAddr)
-	if err != nil {
-		return fmt.Errorf("Could not elect or connect to backend: %v", err)
-	}
-
-	n, err := conn.Write(buf)
-	if err != nil {
-		return fmt.Errorf("Could not write data to %v: %v", clientAddr, err)
-	}
-
-	if n != len(buf) {
-		return fmt.Errorf("Failed to send full packet, expected size %d, actually sent %d", len(buf), n)
-	}
-
-	this.scheduler.IncrementTx(*backend, uint(n))
-
-	return nil
 
 }
 

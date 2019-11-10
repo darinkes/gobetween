@@ -7,9 +7,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/panjf2000/gnet"
 	"github.com/yyyar/gobetween/core"
 	"github.com/yyyar/gobetween/logging"
 	"github.com/yyyar/gobetween/server/scheduler"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -23,6 +26,7 @@ var bufPool = sync.Pool{
 		return make([]byte, UDP_PACKET_SIZE)
 	},
 }
+
 
 type packet struct {
 	// pointer to object that has to be returned to buf pool
@@ -47,6 +51,8 @@ func (p packet) release() {
 }
 
 type Session struct {
+	*gnet.EventServer
+
 	//counters
 	sent uint64
 	recv uint64
@@ -57,8 +63,10 @@ type Session struct {
 	clientAddr *net.UDPAddr
 
 	//connection to backend
-	conn    net.Conn
+	conn    *gnet.Client
 	backend core.Backend
+
+	serverConn gnet.Conn
 
 	//communication
 	out     chan packet
@@ -69,18 +77,51 @@ type Session struct {
 	scheduler *scheduler.Scheduler
 }
 
-func NewSession(clientAddr *net.UDPAddr, conn net.Conn, backend core.Backend, scheduler *scheduler.Scheduler, cfg Config) *Session {
+var establishedChannel chan *gnet.Client
 
+func (s *Session) OnConnectionEstablished(c *gnet.Client) (action gnet.Action) {
+        establishedChannel <- c
+        log.Debugf("Established: %v -> %v\n", c.LocalAddr(), c.RemoteAddr())
+        return
+}
+
+func (s *Session) React(c gnet.Conn) (out []byte, action gnet.Action) {
+	data := c.Read()
+
+	s.scheduler.IncrementRx(s.backend, uint(len(data)))
+
+	_ = unix.Sendto(s.serverConn.Fd(), data, 0, s.serverConn.Sa())
+
+	if s.cfg.MaxResponses > 0 && atomic.AddUint64(&s.recv, 1) >= s.cfg.MaxResponses {
+		return
+	}
+
+        c.ResetBuffer()
+        return
+}
+
+func NewSession(clientAddr *net.UDPAddr, backend core.Backend, scheduler *scheduler.Scheduler, cfg Config, serverConn gnet.Conn) *Session {
 	scheduler.IncrementConnection(backend)
 	s := &Session{
 		cfg:        cfg,
 		clientAddr: clientAddr,
-		conn:       conn,
 		backend:    backend,
 		scheduler:  scheduler,
 		out:        make(chan packet, MAX_PACKETS_QUEUE),
 		stopC:      make(chan struct{}, 1),
+		serverConn: serverConn,
 	}
+
+	establishedChannel = make(chan *gnet.Client, 1)
+
+	go func() {
+		addrStr := fmt.Sprintf("udp://%s:%s", backend.Host, backend.Port)
+		err := gnet.Connect(s, addrStr)
+		if err != nil {
+			panic(err)
+		}
+	}()
+	s.conn = <-establishedChannel
 
 	go func() {
 
@@ -109,20 +150,10 @@ func NewSession(clientAddr *net.UDPAddr, conn net.Conn, backend core.Backend, sc
 					panic("Program error, output channel should not be closed here")
 				}
 
-				n, err := s.conn.Write(pkt.buf())
+				s.conn.Write(pkt.buf())
 				pkt.release()
 
-				if err != nil {
-					log.Errorf("Could not write data to udp connection: %v", err)
-					break
-				}
-
-				if n != pkt.len {
-					log.Errorf("Short write error: should write %d bytes, but %d written", pkt.len, n)
-					break
-				}
-
-				s.scheduler.IncrementTx(s.backend, uint(n))
+				s.scheduler.IncrementTx(s.backend, uint(pkt.len))
 
 				if s.cfg.MaxRequests > 0 && atomic.AddUint64(&s.sent, 1) > s.cfg.MaxRequests {
 					log.Errorf("Restricted to send more UDP packets")
@@ -168,53 +199,6 @@ func (s *Session) Write(buf []byte) error {
 	}
 
 	return nil
-}
-
-/**
- * ListenResponses waits for responses from backend, and sends them back to client address via
- * server connection, so that client is not confused with source host:port of the
- * packet it receives
- */
-func (s *Session) ListenResponses(sendTo *net.UDPConn) {
-
-	go func() {
-		b := make([]byte, UDP_PACKET_SIZE)
-
-		defer s.Close()
-
-		for {
-
-			if s.cfg.BackendIdleTimeout > 0 {
-				s.conn.SetReadDeadline(time.Now().Add(s.cfg.BackendIdleTimeout))
-			}
-
-			n, err := s.conn.Read(b)
-
-			if err != nil {
-				if atomic.LoadUint32(&s.stopped) == 0 {
-					log.Errorf("Failed to read from backend: %v", err)
-				}
-				return
-			}
-
-			s.scheduler.IncrementRx(s.backend, uint(n))
-
-			m, err := sendTo.WriteToUDP(b[0:n], s.clientAddr)
-
-			if err != nil {
-				log.Errorf("Could not send backend response to client: %v", err)
-				return
-			}
-
-			if m != n {
-				return
-			}
-
-			if s.cfg.MaxResponses > 0 && atomic.AddUint64(&s.recv, 1) >= s.cfg.MaxResponses {
-				return
-			}
-		}
-	}()
 }
 
 func (s *Session) IsDone() bool {
